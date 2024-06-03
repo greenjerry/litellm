@@ -60,7 +60,7 @@ class DyanmoDBLogger:
                 "messages": messages,
                 "response": response_obj,
                 "usage": usage,
-                "metadata": metadata,
+                "metadata": "",  # 暂不保存metadata到日志
             }
 
             # Ensure everything in the payload is converted to str

@@ -4,6 +4,7 @@ import TabItem from '@theme/TabItem';
 # Anthropic
 LiteLLM supports
 
+- `claude-3.5`
 - `claude-3` (`claude-3-haiku-20240307`, `claude-3-opus-20240229`, `claude-3-sonnet-20240229`)
 - `claude-2`
 - `claude-2.1`
@@ -11,7 +12,7 @@ LiteLLM supports
 
 :::info
 
-Anthropic API fails requests when `max_tokens` are not passed. Due to this litellm passes `max_tokens=4096` when no `max_tokens` are passed
+Anthropic API fails requests when `max_tokens` are not passed. Due to this litellm passes `max_tokens=4096` when no `max_tokens` are passed.
 
 :::
 
@@ -171,6 +172,7 @@ print(response)
 |------------------|--------------------------------------------|
 | claude-3-haiku  | `completion('claude-3-haiku-20240307', messages)` | `os.environ['ANTHROPIC_API_KEY']`       |
 | claude-3-opus  | `completion('claude-3-opus-20240229', messages)` | `os.environ['ANTHROPIC_API_KEY']`       |
+| claude-3-5-sonnet  | `completion('claude-3-5-sonnet-20240620', messages)` | `os.environ['ANTHROPIC_API_KEY']`       |
 | claude-3-sonnet  | `completion('claude-3-sonnet-20240229', messages)` | `os.environ['ANTHROPIC_API_KEY']`       |
 | claude-2.1  | `completion('claude-2.1', messages)` | `os.environ['ANTHROPIC_API_KEY']`       |
 | claude-2  | `completion('claude-2', messages)` | `os.environ['ANTHROPIC_API_KEY']`       |
@@ -229,17 +231,6 @@ assert isinstance(
 
 ```
 
-### Setting `anthropic-beta` Header in Requests
-
-Pass the the `extra_headers` param to litellm, All headers will be forwarded to Anthropic API
-
-```python
-response = completion(
-    model="anthropic/claude-3-opus-20240229",
-    messages=messages,
-    tools=tools,
-)
-```
 
 ### Forcing Anthropic Tool Use
 

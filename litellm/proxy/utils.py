@@ -1,52 +1,60 @@
-from typing import Optional, List, Any, Literal, Union
-import os, subprocess, hashlib, importlib, asyncio, copy, json, aiohttp, httpx, time
-import litellm, backoff, traceback
-from litellm.proxy._types import (
-    UserAPIKeyAuth,
-    DynamoDBArgs,
-    LiteLLM_VerificationToken,
-    LiteLLM_VerificationTokenView,
-    LiteLLM_SpendLogs,
-    LiteLLM_UserTable,
-    LiteLLM_EndUserTable,
-    LiteLLM_TeamTable,
-    Member,
-    CallInfo,
-    WebhookEvent,
-    AlertType,
-    ResetTeamBudgetRequest,
-    LitellmUserRoles,
-)
+import asyncio
+import copy
+import hashlib
+import importlib
+import json
+import os
+import re
+import smtplib
+import subprocess
+import time
+import traceback
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from functools import wraps
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
+
+import backoff
+import httpx
+from fastapi import HTTPException, Request, status
+from pydantic import BaseModel
+from typing_extensions import overload
+
+import litellm
+import litellm.litellm_core_utils
+import litellm.litellm_core_utils.litellm_logging
+from litellm import EmbeddingResponse, ImageResponse, ModelResponse
+from litellm._logging import verbose_proxy_logger
+from litellm._service_logger import ServiceLogging, ServiceTypes
 from litellm.caching import DualCache, RedisCache
-from litellm.router import Deployment, ModelInfo, LiteLLM_Params
+from litellm.exceptions import RejectedRequestError
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.integrations.slack_alerting import SlackAlerting
 from litellm.llms.custom_httpx.httpx_handler import HTTPHandler
+from litellm.proxy._types import (
+    AlertType,
+    CallInfo,
+    DynamoDBArgs,
+    LiteLLM_VerificationTokenView,
+    LitellmUserRoles,
+    ResetTeamBudgetRequest,
+    SpendLogsMetadata,
+    SpendLogsPayload,
+    UserAPIKeyAuth,
+)
+from litellm.proxy.hooks.cache_control_check import _PROXY_CacheControlCheck
+from litellm.proxy.hooks.max_budget_limiter import _PROXY_MaxBudgetLimiter
 from litellm.proxy.hooks.parallel_request_limiter import (
     _PROXY_MaxParallelRequestsHandler,
 )
-from litellm.exceptions import RejectedRequestError
-from litellm._service_logger import ServiceLogging, ServiceTypes
-from litellm import (
-    ModelResponse,
-    EmbeddingResponse,
-    ImageResponse,
-    TranscriptionResponse,
-    TextCompletionResponse,
-    CustomStreamWrapper,
-    TextCompletionStreamWrapper,
-)
-from litellm.utils import ModelResponseIterator
-from litellm.proxy.hooks.max_budget_limiter import _PROXY_MaxBudgetLimiter
-from litellm.proxy.hooks.cache_control_check import _PROXY_CacheControlCheck
-from litellm.integrations.custom_logger import CustomLogger
-from litellm.proxy.db.base_client import CustomDB
-from litellm._logging import verbose_proxy_logger
-from fastapi import HTTPException, status
-import smtplib, re
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
-from litellm.integrations.slack_alerting import SlackAlerting
-from typing_extensions import overload
+
+if TYPE_CHECKING:
+    from opentelemetry.trace import Span as _Span
+
+    Span = _Span
+else:
+    Span = Any
 
 
 def print_verbose(print_statement):
@@ -57,9 +65,83 @@ def print_verbose(print_statement):
     :param print_statement: The statement to be printed and logged.
     :type print_statement: Any
     """
-    verbose_proxy_logger.debug(print_statement)
+    import traceback
+
+    verbose_proxy_logger.debug("{}\n{}".format(print_statement, traceback.format_exc()))
     if litellm.set_verbose:
         print(f"LiteLLM Proxy: {print_statement}")  # noqa
+
+
+def safe_deep_copy(data):
+    """
+    Safe Deep Copy
+
+    The LiteLLM Request has some object that can-not be pickled / deep copied
+
+    Use this function to safely deep copy the LiteLLM Request
+    """
+
+    # Step 1: Remove the litellm_parent_otel_span
+    if isinstance(data, dict):
+        # remove litellm_parent_otel_span since this is not picklable
+        if "metadata" in data and "litellm_parent_otel_span" in data["metadata"]:
+            litellm_parent_otel_span = data["metadata"].pop("litellm_parent_otel_span")
+    new_data = copy.deepcopy(data)
+
+    # Step 2: re-add the litellm_parent_otel_span after doing a deep copy
+    if isinstance(data, dict):
+        if "metadata" in data:
+            data["metadata"]["litellm_parent_otel_span"] = litellm_parent_otel_span
+    return new_data
+
+
+def log_to_opentelemetry(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start_time = datetime.now()
+
+        try:
+            result = await func(*args, **kwargs)
+            end_time = datetime.now()
+
+            # Log to OTEL only if "parent_otel_span" is in kwargs and is not None
+            if (
+                "parent_otel_span" in kwargs
+                and kwargs["parent_otel_span"] is not None
+                and "proxy_logging_obj" in kwargs
+                and kwargs["proxy_logging_obj"] is not None
+            ):
+                proxy_logging_obj = kwargs["proxy_logging_obj"]
+                await proxy_logging_obj.service_logging_obj.async_service_success_hook(
+                    service=ServiceTypes.DB,
+                    call_type=func.__name__,
+                    parent_otel_span=kwargs["parent_otel_span"],
+                    duration=0.0,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            # end of logging to otel
+            return result
+        except Exception as e:
+            end_time = datetime.now()
+            if (
+                "parent_otel_span" in kwargs
+                and kwargs["parent_otel_span"] is not None
+                and "proxy_logging_obj" in kwargs
+                and kwargs["proxy_logging_obj"] is not None
+            ):
+                proxy_logging_obj = kwargs["proxy_logging_obj"]
+                await proxy_logging_obj.service_logging_obj.async_service_failure_hook(
+                    error=e,
+                    service=ServiceTypes.DB,
+                    call_type=func.__name__,
+                    duration=0.0,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            raise e
+
+    return wrapper
 
 
 ### LOGGING ###
@@ -79,8 +161,12 @@ class ProxyLogging:
         ## INITIALIZE  LITELLM CALLBACKS ##
         self.call_details: dict = {}
         self.call_details["user_api_key_cache"] = user_api_key_cache
-        self.internal_usage_cache = DualCache()
-        self.max_parallel_request_limiter = _PROXY_MaxParallelRequestsHandler()
+        self.internal_usage_cache = DualCache(
+            default_in_memory_ttl=1
+        )  # ping redis cache every 1s
+        self.max_parallel_request_limiter = _PROXY_MaxParallelRequestsHandler(
+            self.internal_usage_cache
+        )
         self.max_budget_limiter = _PROXY_MaxBudgetLimiter()
         self.cache_control_check = _PROXY_CacheControlCheck()
         self.alerting: Optional[List] = None
@@ -106,39 +192,45 @@ class ProxyLogging:
 
     def update_values(
         self,
-        alerting: Optional[List],
-        alerting_threshold: Optional[float],
-        redis_cache: Optional[RedisCache],
+        alerting: Optional[List] = None,
+        alerting_threshold: Optional[float] = None,
+        redis_cache: Optional[RedisCache] = None,
         alert_types: Optional[List[AlertType]] = None,
         alerting_args: Optional[dict] = None,
     ):
-        self.alerting = alerting
+        updated_slack_alerting: bool = False
+        if self.alerting is not None:
+            self.alerting = alerting
+            updated_slack_alerting = True
         if alerting_threshold is not None:
             self.alerting_threshold = alerting_threshold
+            updated_slack_alerting = True
         if alert_types is not None:
             self.alert_types = alert_types
+            updated_slack_alerting = True
 
-        self.slack_alerting_instance.update_values(
-            alerting=self.alerting,
-            alerting_threshold=self.alerting_threshold,
-            alert_types=self.alert_types,
-            alerting_args=alerting_args,
-        )
+        if updated_slack_alerting is True:
+            self.slack_alerting_instance.update_values(
+                alerting=self.alerting,
+                alerting_threshold=self.alerting_threshold,
+                alert_types=self.alert_types,
+                alerting_args=alerting_args,
+            )
 
-        if (
-            self.alerting is not None
-            and "slack" in self.alerting
-            and "daily_reports" in self.alert_types
-        ):
-            # NOTE: ENSURE we only add callbacks when alerting is on
-            # We should NOT add callbacks when alerting is off
-            litellm.callbacks.append(self.slack_alerting_instance)  # type: ignore
+            if (
+                self.alerting is not None
+                and "slack" in self.alerting
+                and "daily_reports" in self.alert_types
+            ):
+                # NOTE: ENSURE we only add callbacks when alerting is on
+                # We should NOT add callbacks when alerting is off
+                litellm.callbacks.append(self.slack_alerting_instance)  # type: ignore
 
         if redis_cache is not None:
             self.internal_usage_cache.redis_cache = redis_cache
 
     def _init_litellm_callbacks(self):
-        print_verbose(f"INITIALIZING LITELLM CALLBACKS!")
+        print_verbose("INITIALIZING LITELLM CALLBACKS!")
         self.service_logging_obj = ServiceLogging()
         litellm.callbacks.append(self.max_parallel_request_limiter)
         litellm.callbacks.append(self.max_budget_limiter)
@@ -149,7 +241,9 @@ class ProxyLogging:
         )
         for callback in litellm.callbacks:
             if isinstance(callback, str):
-                callback = litellm.utils._init_custom_logger_compatible_class(callback)
+                callback = litellm.litellm_core_utils.litellm_logging._init_custom_logger_compatible_class(
+                    callback
+                )
             if callback not in litellm.input_callback:
                 litellm.input_callback.append(callback)
             if callback not in litellm.success_callback:
@@ -173,7 +267,9 @@ class ProxyLogging:
                     + litellm.failure_callback
                 )
             )
-            litellm.utils.set_callbacks(callback_list=callback_list)
+            litellm.litellm_core_utils.litellm_logging.set_callbacks(
+                callback_list=callback_list
+            )
 
     # The actual implementation of the function
     async def pre_call_hook(
@@ -238,7 +334,9 @@ class ProxyLogging:
             return data
         except Exception as e:
             if "litellm_logging_obj" in data:
-                logging_obj: litellm.utils.Logging = data["litellm_logging_obj"]
+                logging_obj: litellm.litellm_core_utils.litellm_logging.Logging = data[
+                    "litellm_logging_obj"
+                ]
 
                 ## ASYNC FAILURE HANDLER ##
                 error_message = ""
@@ -281,7 +379,7 @@ class ProxyLogging:
         """
         Runs the CustomLogger's async_moderation_hook()
         """
-        new_data = copy.deepcopy(data)
+        new_data = safe_deep_copy(data)
         for callback in litellm.callbacks:
             try:
                 if isinstance(callback, CustomLogger):
@@ -362,6 +460,7 @@ class ProxyLogging:
             formatted_message += f"\n\nProxy URL: `{_proxy_base_url}`"
 
         extra_kwargs = {}
+        alerting_metadata = {}
         if request_data is not None:
             _url = self.slack_alerting_instance._add_langfuse_trace_id_to_alert(
                 request_data=request_data
@@ -369,7 +468,12 @@ class ProxyLogging:
             if _url is not None:
                 extra_kwargs["🪢 Langfuse Trace"] = _url
                 formatted_message += "\n\n🪢 Langfuse Trace: {}".format(_url)
-
+            if (
+                "metadata" in request_data
+                and request_data["metadata"].get("alerting_metadata", None) is not None
+                and isinstance(request_data["metadata"]["alerting_metadata"], dict)
+            ):
+                alerting_metadata = request_data["metadata"]["alerting_metadata"]
         for client in self.alerting:
             if client == "slack":
                 await self.slack_alerting_instance.send_alert(
@@ -377,6 +481,7 @@ class ProxyLogging:
                     level=level,
                     alert_type=alert_type,
                     user_info=None,
+                    alerting_metadata=alerting_metadata,
                     **extra_kwargs,
                 )
             elif client == "sentry":
@@ -417,7 +522,7 @@ class ProxyLogging:
         )
 
         if hasattr(self, "service_logging_obj"):
-            self.service_logging_obj.async_service_failure_hook(
+            await self.service_logging_obj.async_service_failure_hook(
                 service=ServiceTypes.DB,
                 duration=duration,
                 error=error_message,
@@ -586,7 +691,7 @@ class PrismaClient:
             finally:
                 os.chdir(original_dir)
             # Now you can import the Prisma Client
-            from prisma import Prisma
+            from prisma import Prisma  # type: ignore
 
         self.db = Prisma()  # Client to connect to Prisma db
 
@@ -831,6 +936,7 @@ class PrismaClient:
         max_time=10,  # maximum total time to retry for
         on_backoff=on_backoff,  # specifying the function to call on backoff
     )
+    @log_to_opentelemetry
     async def get_data(
         self,
         token: Optional[Union[str, list]] = None,
@@ -857,6 +963,8 @@ class PrismaClient:
         limit: Optional[
             int
         ] = None,  # pagination, number of rows to getch when find_all==True
+        parent_otel_span: Optional[Span] = None,
+        proxy_logging_obj: Optional[ProxyLogging] = None,
     ):
         args_passed_in = locals()
         start_time = time.time()
@@ -1848,8 +1956,7 @@ async def send_email(receiver_email, subject, html):
     sender_email,
     """
     ## SERVER SETUP ##
-    from litellm.proxy.proxy_server import premium_user
-    from litellm.proxy.proxy_server import CommonProxyErrors
+    from litellm.proxy.proxy_server import CommonProxyErrors, premium_user
 
     smtp_host = os.getenv("SMTP_HOST")
     smtp_port = int(os.getenv("SMTP_PORT", "587"))  # default to port 587
@@ -1864,6 +1971,9 @@ async def send_email(receiver_email, subject, html):
     email_message["From"] = sender_email
     email_message["To"] = receiver_email
     email_message["Subject"] = subject
+    verbose_proxy_logger.debug(
+        "sending email from %s to %s", sender_email, receiver_email
+    )
 
     # Attach the body to the email
     email_message.attach(MIMEText(html, "html"))
@@ -1895,16 +2005,16 @@ def hash_token(token: str):
 
 def get_logging_payload(
     kwargs, response_obj, start_time, end_time, end_user_id: Optional[str]
-):
-    from litellm.proxy._types import LiteLLM_SpendLogs
+) -> SpendLogsPayload:
     from pydantic import Json
-    import uuid
+
+    from litellm.proxy._types import LiteLLM_SpendLogs
 
     verbose_proxy_logger.debug(
         f"SpendTable: get_logging_payload - kwargs: {kwargs}\n\n"
     )
 
-    if kwargs == None:
+    if kwargs is None:
         kwargs = {}
     # standardize this function to be used across, s3, dynamoDB, langfuse logging
     litellm_params = kwargs.get("litellm_params", {})
@@ -1927,103 +2037,122 @@ def get_logging_payload(
     _model_group = metadata.get("model_group", "")
 
     # clean up litellm metadata
+    clean_metadata = SpendLogsMetadata(
+        user_api_key=None,
+        user_api_key_alias=None,
+        user_api_key_team_id=None,
+        user_api_key_user_id=None,
+        user_api_key_team_alias=None,
+        spend_logs_metadata=None,
+    )
     if isinstance(metadata, dict):
-        clean_metadata = {}
         verbose_proxy_logger.debug(
-            f"getting payload for SpendLogs, available keys in metadata: "
+            "getting payload for SpendLogs, available keys in metadata: "
             + str(list(metadata.keys()))
         )
-        for key in metadata:
-            if key in [
-                "headers",
-                "endpoint",
-                "model_group",
-                "deployment",
-                "model_info",
-                "caching_groups",
-                "previous_models",
-            ]:
-                continue
-            else:
-                clean_metadata[key] = metadata[key]
+
+        # Filter the metadata dictionary to include only the specified keys
+        clean_metadata = SpendLogsMetadata(
+            **{  # type: ignore
+                key: metadata[key]
+                for key in SpendLogsMetadata.__annotations__.keys()
+                if key in metadata
+            }
+        )
 
     if litellm.cache is not None:
         cache_key = litellm.cache.get_cache_key(**kwargs)
     else:
         cache_key = "Cache OFF"
-    if cache_hit == True:
+    if cache_hit is True:
         import time
 
         id = f"{id}_cache_hit{time.time()}"  # SpendLogs does not allow duplicate request_id
 
-    payload = {
-        "request_id": id,
-        "call_type": call_type,
-        "api_key": api_key,
-        "cache_hit": cache_hit,
-        "startTime": start_time,
-        "endTime": end_time,
-        "completionStartTime": completion_start_time,
-        "model": kwargs.get("model", ""),
-        "user": kwargs.get("litellm_params", {})
-        .get("metadata", {})
-        .get("user_api_key_user_id", ""),
-        "team_id": kwargs.get("litellm_params", {})
-        .get("metadata", {})
-        .get("user_api_key_team_id", ""),
-        "metadata": clean_metadata,
-        "cache_key": cache_key,
-        "spend": kwargs.get("response_cost", 0),
-        "total_tokens": usage.get("total_tokens", 0),
-        "prompt_tokens": usage.get("prompt_tokens", 0),
-        "completion_tokens": usage.get("completion_tokens", 0),
-        "request_tags": metadata.get("tags", []),
-        "end_user": end_user_id or "",
-        "api_base": litellm_params.get("api_base", ""),
-        "model_group": _model_group,
-        "model_id": _model_id,
-    }
+    try:
+        payload: SpendLogsPayload = SpendLogsPayload(
+            request_id=str(id),
+            call_type=call_type or "",
+            api_key=str(api_key),
+            cache_hit=str(cache_hit),
+            startTime=start_time,
+            endTime=end_time,
+            completionStartTime=completion_start_time,
+            model=kwargs.get("model", "") or "",
+            user=kwargs.get("litellm_params", {})
+            .get("metadata", {})
+            .get("user_api_key_user_id", "")
+            or "",
+            team_id=kwargs.get("litellm_params", {})
+            .get("metadata", {})
+            .get("user_api_key_team_id", "")
+            or "",
+            metadata=json.dumps(clean_metadata),
+            cache_key=cache_key,
+            spend=kwargs.get("response_cost", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            request_tags=(
+                json.dumps(metadata.get("tags", []))
+                if isinstance(metadata.get("tags", []), dict)
+                else "[]"
+            ),
+            end_user=end_user_id or "",
+            api_base=litellm_params.get("api_base", ""),
+            model_group=_model_group,
+            model_id=_model_id,
+        )
 
-    verbose_proxy_logger.debug("SpendTable: created payload - payload: %s\n\n", payload)
-    json_fields = [
-        field
-        for field, field_type in LiteLLM_SpendLogs.__annotations__.items()
-        if field_type == Json or field_type == Optional[Json]
-    ]
-    str_fields = [
-        field
-        for field, field_type in LiteLLM_SpendLogs.__annotations__.items()
-        if field_type == str or field_type == Optional[str]
-    ]
-    datetime_fields = [
-        field
-        for field, field_type in LiteLLM_SpendLogs.__annotations__.items()
-        if field_type == datetime
-    ]
+        verbose_proxy_logger.debug(
+            "SpendTable: created payload - payload: %s\n\n", payload
+        )
 
-    for param in json_fields:
-        if param in payload and type(payload[param]) != Json:
-            if type(payload[param]) == litellm.ModelResponse:
-                payload[param] = payload[param].model_dump_json()
-            if type(payload[param]) == litellm.EmbeddingResponse:
-                payload[param] = payload[param].model_dump_json()
-            else:
-                payload[param] = json.dumps(payload[param])
-
-    for param in str_fields:
-        if param in payload and type(payload[param]) != str:
-            payload[param] = str(payload[param])
-
-    return payload
+        return payload
+    except Exception as e:
+        verbose_proxy_logger.error(
+            "Error creating spendlogs object - {}\n{}".format(
+                str(e), traceback.format_exc()
+            )
+        )
+        raise e
 
 
-def _duration_in_seconds(duration: str):
-    match = re.match(r"(\d+)([smhd]?)", duration)
+def _extract_from_regex(duration: str) -> Tuple[int, str]:
+    match = re.match(r"(\d+)(mo|[smhd]?)", duration)
+
     if not match:
         raise ValueError("Invalid duration format")
 
     value, unit = match.groups()
     value = int(value)
+
+    return value, unit
+
+
+def get_last_day_of_month(year, month):
+    # Handle December case
+    if month == 12:
+        return 31
+    # Next month is January, so subtract a day from March 1st
+    next_month = datetime(year=year, month=month + 1, day=1)
+    last_day_of_month = (next_month - timedelta(days=1)).day
+    return last_day_of_month
+
+
+def _duration_in_seconds(duration: str) -> int:
+    """
+    Parameters:
+    - duration:
+        - "<number>s" - seconds
+        - "<number>m" - minutes
+        - "<number>h" - hours
+        - "<number>d" - days
+        - "<number>mo" - months
+
+    Returns time in seconds till when budget needs to be reset
+    """
+    value, unit = _extract_from_regex(duration=duration)
 
     if unit == "s":
         return value
@@ -2033,6 +2162,38 @@ def _duration_in_seconds(duration: str):
         return value * 3600
     elif unit == "d":
         return value * 86400
+    elif unit == "mo":
+        now = time.time()
+        current_time = datetime.fromtimestamp(now)
+
+        if current_time.month == 12:
+            target_year = current_time.year + 1
+            target_month = 1
+        else:
+            target_year = current_time.year
+            target_month = current_time.month + value
+
+        # Determine the day to set for next month
+        target_day = current_time.day
+        last_day_of_target_month = get_last_day_of_month(target_year, target_month)
+
+        if target_day > last_day_of_target_month:
+            target_day = last_day_of_target_month
+
+        next_month = datetime(
+            year=target_year,
+            month=target_month,
+            day=target_day,
+            hour=current_time.hour,
+            minute=current_time.minute,
+            second=current_time.second,
+            microsecond=current_time.microsecond,
+        )
+
+        # Calculate the duration until the first day of the next month
+        duration_until_next_month = next_month - current_time
+        return int(duration_until_next_month.total_seconds())
+
     else:
         raise ValueError("Unsupported duration unit")
 
@@ -2521,36 +2682,6 @@ async def update_spend(
                 raise e
 
 
-async def _read_request_body(request):
-    """
-    Asynchronous function to read the request body and parse it as JSON or literal data.
-
-    Parameters:
-    - request: The request object to read the body from
-
-    Returns:
-    - dict: Parsed request data as a dictionary
-    """
-    import ast, json
-
-    try:
-        request_data = {}
-        if request is None:
-            return request_data
-        body = await request.body()
-
-        if body == b"" or body is None:
-            return request_data
-        body_str = body.decode()
-        try:
-            request_data = ast.literal_eval(body_str)
-        except:
-            request_data = json.loads(body_str)
-        return request_data
-    except:
-        return {}
-
-
 def _is_projected_spend_over_limit(
     current_spend: float, soft_budget_limit: Optional[float]
 ):
@@ -2628,49 +2759,9 @@ def _is_valid_team_configs(team_id=None, team_config=None, request_data=None):
     return
 
 
-def _is_user_proxy_admin(user_id_information: Optional[list]):
-    if user_id_information is None:
-        return False
-
-    if len(user_id_information) == 0 or user_id_information[0] is None:
-        return False
-
-    _user = user_id_information[0]
-    if (
-        _user.get("user_role", None) is not None
-        and _user.get("user_role") == LitellmUserRoles.PROXY_ADMIN.value
-    ):
-        return True
-
-    # if user_id_information contains litellm-proxy-budget
-    # get first user_id that is not litellm-proxy-budget
-    for user in user_id_information:
-        if user.get("user_id") != "litellm-proxy-budget":
-            _user = user
-            break
-
-    if (
-        _user.get("user_role", None) is not None
-        and _user.get("user_role") == LitellmUserRoles.PROXY_ADMIN.value
-    ):
-        return True
-
-    return False
-
-
-def _get_user_role(user_id_information: Optional[list]):
-    if user_id_information is None:
-        return None
-
-    if len(user_id_information) == 0 or user_id_information[0] is None:
-        return None
-
-    _user = user_id_information[0]
-    return _user.get("user_role")
-
-
 def encrypt_value(value: str, master_key: str):
     import hashlib
+
     import nacl.secret
     import nacl.utils
 
@@ -2691,6 +2782,7 @@ def encrypt_value(value: str, master_key: str):
 
 def decrypt_value(value: bytes, master_key: str) -> str:
     import hashlib
+
     import nacl.secret
     import nacl.utils
 
@@ -2709,13 +2801,15 @@ def decrypt_value(value: bytes, master_key: str) -> str:
 
 
 # LiteLLM Admin UI - Non SSO Login
-html_form = """
+url_to_redirect_to = os.getenv("PROXY_BASE_URL", "")
+url_to_redirect_to += "/login"
+html_form = f"""
 <!DOCTYPE html>
 <html>
 <head>
     <title>LiteLLM Login</title>
     <style>
-        body {
+        body {{
             font-family: Arial, sans-serif;
             background-color: #f4f4f4;
             margin: 0;
@@ -2724,42 +2818,42 @@ html_form = """
             justify-content: center;
             align-items: center;
             height: 100vh;
-        }
+        }}
 
-        form {
+        form {{
             background-color: #fff;
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
-        }
+        }}
 
-        label {
+        label {{
             display: block;
             margin-bottom: 8px;
-        }
+        }}
 
-        input {
+        input {{
             width: 100%;
             padding: 8px;
             margin-bottom: 16px;
             box-sizing: border-box;
             border: 1px solid #ccc;
             border-radius: 4px;
-        }
+        }}
 
-        input[type="submit"] {
+        input[type="submit"] {{
             background-color: #4caf50;
             color: #fff;
             cursor: pointer;
-        }
+        }}
 
-        input[type="submit"]:hover {
+        input[type="submit"]:hover {{
             background-color: #45a049;
-        }
+        }}
     </style>
 </head>
 <body>
-    <form action="/login" method="post">
+    <form action="{url_to_redirect_to}" method="post">
         <h2>LiteLLM Login</h2>
 
         <p>By default Username is "admin" and Password is your set LiteLLM Proxy `MASTER_KEY`</p>
@@ -2771,8 +2865,6 @@ html_form = """
         <input type="password" id="password" name="password" required>
         <input type="submit" value="Submit">
     </form>
-</body>
-</html>
 """
 
 
@@ -2837,3 +2929,21 @@ missing_keys_html_form = """
     </body>
     </html>
     """
+
+
+def _to_ns(dt):
+    return int(dt.timestamp() * 1e9)
+
+
+def get_error_message_str(e: Exception) -> str:
+    error_message = ""
+    if isinstance(e, HTTPException):
+        if isinstance(e.detail, str):
+            error_message = e.detail
+        elif isinstance(e.detail, dict):
+            error_message = json.dumps(e.detail)
+        else:
+            error_message = str(e)
+    else:
+        error_message = str(e)
+    return error_message

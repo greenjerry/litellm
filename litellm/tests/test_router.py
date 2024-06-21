@@ -1,22 +1,52 @@
 #### What this tests ####
 # This tests litellm router
 
-import sys, os, time, openai
-import traceback, asyncio
+import asyncio
+import os
+import sys
+import time
+import traceback
+
+import openai
 import pytest
 
 sys.path.insert(
     0, os.path.abspath("../..")
 )  # Adds the parent directory to the system path
+import os
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+from dotenv import load_dotenv
+
 import litellm
 from litellm import Router
 from litellm.router import Deployment, LiteLLM_Params, ModelInfo
-from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
-from dotenv import load_dotenv
-import os, httpx
 
 load_dotenv()
+
+
+def test_router_multi_org_list():
+    """
+    Pass list of orgs in 1 model definition,
+    expect a unique deployment for each to be created
+    """
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "*",
+                "litellm_params": {
+                    "model": "openai/*",
+                    "api_key": "my-key",
+                    "api_base": "https://api.openai.com/v1",
+                    "organization": ["org-1", "org-2", "org-3"],
+                },
+            }
+        ]
+    )
+
+    assert len(router.get_model_list()) == 3
 
 
 def test_router_sensitive_keys():
@@ -36,6 +66,48 @@ def test_router_sensitive_keys():
     except Exception as e:
         print(f"error msg - {str(e)}")
         assert "special-key" not in str(e)
+
+
+def test_router_order():
+    """
+    Asserts for 2 models in a model group, model with order=1 always called first
+    """
+    router = Router(
+        model_list=[
+            {
+                "model_name": "gpt-3.5-turbo",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": os.getenv("OPENAI_API_KEY"),
+                    "mock_response": "Hello world",
+                    "order": 1,
+                },
+                "model_info": {"id": "1"},
+            },
+            {
+                "model_name": "gpt-3.5-turbo",
+                "litellm_params": {
+                    "model": "gpt-4o",
+                    "api_key": "bad-key",
+                    "mock_response": Exception("this is a bad key"),
+                    "order": 2,
+                },
+                "model_info": {"id": "2"},
+            },
+        ],
+        num_retries=0,
+        allowed_fails=0,
+        enable_pre_call_checks=True,
+    )
+
+    for _ in range(100):
+        response = router.completion(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Hey, how's it going?"}],
+        )
+
+        assert isinstance(response, litellm.ModelResponse)
+        assert response._hidden_params["model_id"] == "1"
 
 
 @pytest.mark.parametrize("num_retries", [None, 2])
@@ -485,8 +557,9 @@ def test_router_context_window_fallback():
     - Send a 5k prompt
     - Assert it works
     """
-    from large_text import text
     import os
+
+    from large_text import text
 
     litellm.set_verbose = False
 
@@ -535,8 +608,9 @@ async def test_async_router_context_window_fallback():
     - Send a 5k prompt
     - Assert it works
     """
-    from large_text import text
     import os
+
+    from large_text import text
 
     litellm.set_verbose = False
 
@@ -618,8 +692,9 @@ def test_router_context_window_check_pre_call_check_in_group():
     - Send a 5k prompt
     - Assert it works
     """
-    from large_text import text
     import os
+
+    from large_text import text
 
     litellm.set_verbose = False
 
@@ -666,8 +741,9 @@ def test_router_context_window_check_pre_call_check_out_group():
     - Send a 5k prompt
     - Assert it works
     """
-    from large_text import text
     import os
+
+    from large_text import text
 
     litellm.set_verbose = False
 
@@ -1233,6 +1309,21 @@ def test_openai_completion_on_router():
 # test_openai_completion_on_router()
 
 
+def test_model_group_info():
+    router = Router(
+        model_list=[
+            {
+                "model_name": "command-r-plus",
+                "litellm_params": {"model": "cohere.command-r-plus-v1:0"},
+            }
+        ]
+    )
+
+    response = router.get_model_group_info(model_group="command-r-plus")
+
+    assert response is not None
+
+
 def test_consistent_model_id():
     """
     - For a given model group + litellm params, assert the model id is always the same
@@ -1479,8 +1570,9 @@ def test_router_anthropic_key_dynamic():
 
 def test_router_timeout():
     litellm.set_verbose = True
-    from litellm._logging import verbose_logger
     import logging
+
+    from litellm._logging import verbose_logger
 
     verbose_logger.setLevel(logging.DEBUG)
     model_list = [
